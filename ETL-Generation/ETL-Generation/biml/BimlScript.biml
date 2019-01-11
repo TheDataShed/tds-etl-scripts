@@ -1,0 +1,165 @@
+<#@ import namespace="System.Data"#>
+<#@ import namespace="System"#>
+<#@ import namespace="System.Data.SqlClient"#>
+<#@ import namespace="System.IO"#>
+<#@ import namespace="System.Xml"#>
+
+<Biml xmlns="http://schemas.varigence.com/biml.xsd">
+    <Connections>
+        <OleDbConnection Name="HubDb" ConnectionString="Data Source=.; Initial Catalog=sdtStaging; Provider=SQLNCLI11.1;Integrated Security=SSPI;" CreateInProject="true" CreatePackageConfiguration="false"/>
+        <OleDbConnection Name="LendingDb" ConnectionString="Data Source=.; Initial Catalog=lending; Provider=SQLNCLI11.1;Integrated Security=SSPI;" CreateInProject="true" CreatePackageConfiguration="false"/>
+        <OleDbConnection Name="CRADb" ConnectionString="Data Source=.; Initial Catalog=cra; Provider=SQLNCLI11.1;Integrated Security=SSPI;" CreateInProject="true" CreatePackageConfiguration="false"/>
+    </Connections>
+    <# /*Declare variables */
+    string metadataConnection = "Data Source=.;Initial Catalog=lending;Provider=SQLNCLI11.1;Integrated Security=SSPI;"; // The connection string to the metadata database.
+
+
+    /* Retrieve metedata for package/*/
+    var fileMetadatasdt = ExternalDataAccess.GetDataTable(metadataConnection,"SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.tables as t WHERE t.TABLE_SCHEMA = 'lendingetl' and t.TABLE_NAME IN('agreement','customer','customeraddress','product','transactionallocation','user','rebatetopayperpound','customerApplicationLimit')");
+    var fileMetadatacra = ExternalDataAccess.GetDataTable(metadataConnection,"SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.tables as t WHERE t.TABLE_SCHEMA = 'lendingetl' and t.TABLE_NAME NOT IN('agreement','customer','customeraddress','product','transactionallocation','user','rebatetopayperpound','customerApplicationLimit')");
+    #>
+    <Projects>
+        <PackageProject Name="MasterConfig" ProtectionLevel="DontSaveSensitive">
+            <Connections>
+                <Connection ConnectionName="HubDb"/>
+                <Connection ConnectionName="LendingDb"/>
+                <Connection ConnectionName="CRADb"/>
+            </Connections>
+            <Parameters>
+            </Parameters>
+            <Packages>
+                <# foreach (DataRow row in fileMetadatasdt.Rows) { #>
+                    <Package PackageName="Load_<#=row[1]#>"/>
+                <# } 
+                 foreach (DataRow row in fileMetadatacra.Rows) { #>
+                    <Package PackageName="Load_<#=row[1]#>"/>
+                <# } #>
+            </Packages>        
+        </PackageProject>
+    </Projects>
+    <Packages>
+        <# foreach (DataRow row in fileMetadatasdt.Rows)
+            {
+        #>
+            <Package Name="Load_<#=row[1]#>" ConstraintMode="Parallel">
+            <Parameters>
+                <!--<Parameter Name="IncrementalOrFullLoad" DataType="String" IsRequired="true">F</Parameter> -->
+            </Parameters>
+                <Variables>
+                    <Variable Name="IncrementalOrFullLoad" DataType="String" EvaluateAsExpression="false" InheritFromPackageParentConfigurationString="User::ChildPackageExecType">F</Variable>
+                    <Variable Name="WorkTableName" DataType="String" EvaluateAsExpression="false">work.<#=row[0]#>_<#=row[1]#></Variable>
+                    <Variable Name="TargetTableName" DataType="String" EvaluateAsExpression="false"><#=row[0]#>.[<#=row[1]#>]</Variable>
+                    <Variable Name="WorkTruncateSQL" DataType="String" EvaluateAsExpression="true">"TRUNCATE TABLE " + @[User::WorkTableName]</Variable>
+                    <Variable Name="GetMaxId" DataType="String" EvaluateAsExpression="true">"Exec utility.gettablemaxid '" + @[User::IncrementalOrFullLoad] + "' , '" + @[User::TargetTableName]+"' ,? OUTPUT"</Variable>
+                    <Variable Name="SelectSQL" DataType="String" EvaluateAsExpression="true">"Exec lendingetl.[<#=row[1]#>] " + (DT_WSTR,100)@[User::MaxId]</Variable>
+                    <Variable Name="MaxId" DataType="Int64" EvaluateAsExpression="false">-1</Variable>
+                </Variables>
+                <Tasks>
+                    <Container Name ="Process <#=row[1]#>" ConstraintMode="Parallel">
+                        <Tasks>
+                            <ExecuteSQL Name="TruncateWorkTable" ConnectionName="LendingDb">
+                                <VariableInput VariableName="User.WorkTruncateSQL"/>
+                            </ExecuteSQL>
+                            <ExecuteSQL Name="GetMaxId" ConnectionName="LendingDb">
+                                <VariableInput VariableName="User.GetMaxId"/>
+                                <Parameters>
+                                    <Parameter VariableName="User.MaxId" Name="0" DataType="Int64" Direction="Output"/>
+                                </Parameters>
+                                <PrecedenceConstraints>
+                                    <Inputs>
+                                        <Input OutputPathName="TruncateWorkTable.Output"/>
+                                    </Inputs>
+                                </PrecedenceConstraints>    
+                            </ExecuteSQL>
+                        <Dataflow Name="DF Insert into Worktable" DefaultBufferSize="104857600" DefaultBufferMaxRows="50000">
+                            <PrecedenceConstraints>
+                                <Inputs>
+                                    <Input OutputPathName="GetMaxId.Output"/>
+                                </Inputs>
+                            </PrecedenceConstraints>
+                            <Transformations>
+                                <OleDbSource ConnectionName="HubDb" Name="Source" DefaultCodePage="1252">
+                                    <VariableInput VariableName="User.SelectSQL"/>
+                                </OleDbSource>
+                                <OleDbDestination ConnectionName="LendingDb" Name="Target" BatchSize="15000" UseFastLoadIfAvailable="true" MaximumInsertCommitSize="15000">
+                                    <InputPath OutputPathName="Source.Output"/>    
+                                    <ExternalTableOutput Table="work.<#=row[0]#>_<#=row[1]#>"/>
+                                </OleDbDestination>
+                            </Transformations>
+                        </Dataflow>
+                        <ExecuteSQL Name="Merge WorkTable into Destination" ConnectionName="LendingDb">
+                            <DirectInput>exec work.usp_merge_<#=row[0]#>_<#=row[1]#></DirectInput>
+                            <PrecedenceConstraints>
+                                <Inputs>
+                                    <Input OutputPathName="DF Insert into Worktable.Output"/>
+                                </Inputs>
+                            </PrecedenceConstraints>
+                        </ExecuteSQL>
+                        </Tasks>
+                    </Container>
+                </Tasks>
+            </Package>
+        <# } 
+        foreach (DataRow row in fileMetadatacra.Rows) 
+           { 
+        #>           
+            <Package Name="Load_<#=row[1]#>" ConstraintMode="Parallel">
+            <Parameters>
+            </Parameters>
+                <Variables>
+                    <Variable Name="IncrementalOrFullLoad" DataType="String" EvaluateAsExpression="false" InheritFromPackageParentConfigurationString="User::ChildPackageExecType">F</Variable>
+                    <Variable Name="WorkTableName" DataType="String" EvaluateAsExpression="false">work.<#=row[0]#>_<#=row[1]#></Variable>
+                    <Variable Name="TargetTableName" DataType="String" EvaluateAsExpression="false"><#=row[0]#>.<#=row[1]#></Variable>
+                    <Variable Name="WorkTruncateSQL" DataType="String" EvaluateAsExpression="true">"TRUNCATE TABLE " + @[User::WorkTableName]</Variable>
+                    <Variable Name="GetMaxId" DataType="String" EvaluateAsExpression="true">"Exec utility.gettablemaxid '" + @[User::IncrementalOrFullLoad] + "' , '" + @[User::TargetTableName]+"' ,? OUTPUT"</Variable>
+                    <Variable Name="SelectSQL" DataType="String" EvaluateAsExpression="true">"Exec lendingetl.[<#=row[1]#>] " + (DT_WSTR,100)@[User::MaxId]</Variable>
+                    <Variable Name="MaxId" DataType="Int64" EvaluateAsExpression="false">-1</Variable>
+                </Variables>
+                <Tasks>
+                    <Container Name ="Process <#=row[1]#>" ConstraintMode="Parallel">
+                        <Tasks>
+                            <ExecuteSQL Name="TruncateWorkTable" ConnectionName="LendingDb">
+                                <VariableInput VariableName="User.WorkTruncateSQL"/>
+                            </ExecuteSQL>
+                            <ExecuteSQL Name="GetMaxId" ConnectionName="LendingDb">
+                                <VariableInput VariableName="User.GetMaxId"/>
+                                <Parameters>
+                                    <Parameter VariableName="User.MaxId" Name="0" DataType="Int64" Direction="Output"/>
+                                </Parameters>
+                                <PrecedenceConstraints>
+                                    <Inputs>
+                                        <Input OutputPathName="TruncateWorkTable.Output"/>
+                                    </Inputs>
+                                </PrecedenceConstraints>    
+                            </ExecuteSQL>
+                        <Dataflow Name="DF Insert into Worktable" DefaultBufferSize="104857600" DefaultBufferMaxRows="50000">
+                            <PrecedenceConstraints>
+                                <Inputs>
+                                    <Input OutputPathName="GetMaxId.Output"/>
+                                </Inputs>
+                            </PrecedenceConstraints>
+                            <Transformations>
+                                <OleDbSource ConnectionName="CRADb" Name="Source" DefaultCodePage="1252">
+                                    <VariableInput VariableName="User.SelectSQL"/>
+                                </OleDbSource>
+                                <OleDbDestination ConnectionName="LendingDb" Name="Target" BatchSize="15000" UseFastLoadIfAvailable="true" MaximumInsertCommitSize="15000">
+                                    <InputPath OutputPathName="Source.Output"/>    
+                                    <ExternalTableOutput Table="work.<#=row[0]#>_<#=row[1]#>"/>
+                                </OleDbDestination>
+                            </Transformations>
+                        </Dataflow>
+                        <ExecuteSQL Name="Merge WorkTable into Destination" ConnectionName="LendingDb">
+                            <DirectInput>exec work.usp_merge_<#=row[0]#>_<#=row[1]#></DirectInput>
+                            <PrecedenceConstraints>
+                                <Inputs>
+                                    <Input OutputPathName="DF Insert into Worktable.Output"/>
+                                </Inputs>
+                            </PrecedenceConstraints>
+                        </ExecuteSQL>
+                        </Tasks>
+                    </Container>
+                </Tasks>
+            </Package>
+        <# } #> 
+    </Packages>
+</Biml>
